@@ -1,4 +1,4 @@
-#DeepFake Image Detection using Vision Transformer (ViT-B/16)
+##DeepFake Image Detection using Vision Transformer (ViT-B/16)
 
 
 A deep learning mini-project that classifies images as Fake or Real using a fine-tuned Vision Transformer (ViT-B/16).
