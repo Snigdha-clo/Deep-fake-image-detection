@@ -1,4 +1,6 @@
-DeepFake Image Detection using Vision Transformer (ViT-B/16)
+#DeepFake Image Detection using Vision Transformer (ViT-B/16)
+
+
 A deep learning mini-project that classifies images as Fake or Real using a fine-tuned Vision Transformer (ViT-B/16).
 Project Overview
 Deepfake images can be difficult to distinguish from authentic images through visual inspection alone. This project explores transfer learning with Google's ViT-B/16 architecture to identify visual patterns that help distinguish fake images from real ones.
