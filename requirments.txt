@@ -1,0 +1,25 @@
+# Core numerical and image processing
+numpy
+pandas
+Pillow
+opencv-python-headless
+
+# Machine learning and evaluation
+scikit-learn
+joblib
+
+# Vision Transformer implementation (JAX / Flax)
+jax
+flax
+optax
+ml-collections
+
+# Dataset loading
+datasets
+
+# Plotting
+matplotlib
+
+# Notebook environment
+jupyter
+ipykernel
