@@ -1,0 +1,22 @@
+{
+    "model": "ViT-B/16 Fine-Tuned",
+    "dataset": "OpenDeepfake-Preview",
+    "epochs": 1,
+    "batch_size": 2,
+    "learning_rate": 1e-05,
+    "test_accuracy": 0.98,
+    "test_precision": 0.9918032786885246,
+    "test_recall": 0.968,
+    "test_f1": 0.979757085020243,
+    "test_roc_auc": 0.9988302222222223,
+    "confusion_matrix": [
+        [
+            1488,
+            12
+        ],
+        [
+            48,
+            1452
+        ]
+    ]
+}
