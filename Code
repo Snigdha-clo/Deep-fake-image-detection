@@ -1,0 +1,585 @@
+# -*- coding: utf-8 -*-
+"""
+Deepfake image detection with the official Vision Transformer (ViT-B/16)
+Dataset : prithivMLmods/OpenDeepfake-Preview (Hugging Face)
+Model   : Google Research vision_transformer (JAX/Flax), ImageNet-21k weights
+
+This single file collects every code cell of the project notebook in running
+order. It is written for Google Colab (T4 GPU). Cells are separated by
+"# %%" markers, so VS Code / Jupytext / Colab can also treat it as a notebook.
+
+What this script does
+  1. Setup            clone official repo, install deps, load ViT-B/16 weights
+  2. Data             load OpenDeepfake-Preview, stratified 70/15/15 split (seed 42)
+  3. Baseline         frozen ViT features + logistic regression
+  4. Fine-tuning      full fine-tuning (AdamW, lr 1e-5, batch 2), test evaluation
+  5. Ablation         epochs 2-3 (analysis only; model chosen by validation loss)
+  6. Duplicate audit  exact-duplicate (pixel hash) check on the evaluated split
+
+Switch parts on/off in the CONFIG cell. Nothing is trained if a saved
+checkpoint already exists (set FORCE_RETRAIN = True to override), so the
+reported test results can be reproduced quickly from the checkpoint.
+"""
+
+# %% ---------------------------------------------------------------- CONFIG
+import os
+
+RUN_BASELINE = True          # frozen features + logistic regression
+RUN_FINETUNE = True          # fine-tune (or load the saved epoch-1 checkpoint)
+RUN_ABLATION = False         # epochs 2-3 (about 35 more minutes on a T4)
+RUN_DUPLICATE_AUDIT = True   # hash images, report train/val/test overlap
+FORCE_RETRAIN = False        # True = ignore an existing checkpoint
+
+SEED = 42
+FT_BATCH_SIZE = 2
+LEARNING_RATE = 1e-5
+WEIGHT_DECAY = 1e-4
+EVAL_BATCH_SIZE = 16
+FEATURE_BATCH_SIZE = 8
+
+WORK_DIR = "/content"
+VIT_CHECKPOINT = f"{WORK_DIR}/ViT-B_16.npz"                      # ImageNet-21k weights
+PROJECT_DIR = f"{WORK_DIR}/deepfake_vit_project"
+RESULTS_DIR = f"{PROJECT_DIR}/results"
+CHECKPOINT_DIR = f"{PROJECT_DIR}/checkpoints"
+BEST_CKPT = f"{CHECKPOINT_DIR}/best_vit_checkpoint.msgpack"
+
+for d in (RESULTS_DIR, CHECKPOINT_DIR):
+    os.makedirs(d, exist_ok=True)
+
+
+# %% ------------------------------------------- 1. SETUP: repo + packages
+import subprocess, sys
+
+
+def sh(cmd):
+    """Run a shell command and stream its output (replaces notebook '!' lines)."""
+    print(f"$ {cmd}")
+    subprocess.run(cmd, shell=True, check=False)
+
+
+# Official Google Research ViT repository
+if not os.path.isdir(f"{WORK_DIR}/vision_transformer"):
+    sh(f"git clone --depth=1 https://github.com/google-research/vision_transformer.git {WORK_DIR}/vision_transformer")
+sh(f"cd {WORK_DIR}/vision_transformer && git remote -v && ls vit_jax")
+
+sh(f"{sys.executable} -m pip install -q ml-collections datasets scikit-learn "
+   "pandas matplotlib pillow opencv-python-headless joblib optax")
+
+# The repository must be importable (vit_jax package)
+sys.path.insert(0, f"{WORK_DIR}/vision_transformer")
+
+sh("nvidia-smi")
+
+
+# %% ------------------------------------- 1b. JAX compatibility shim
+# Older repository code expects jax.core.get_opaque_trace_state, which moved to
+# jax.extend.core in JAX 0.11+.  (jax.extend must be imported explicitly.)
+import jax
+import jax.extend
+import jax.extend.core
+import flax
+
+if not hasattr(jax.core, "get_opaque_trace_state"):
+    jax.core.get_opaque_trace_state = jax.extend.core.get_opaque_trace_state
+
+print("JAX version :", jax.__version__)
+print("Flax version:", flax.__version__)
+print("Devices     :", jax.devices())
+
+
+# %% ------------------------ 1c. Build the official ViT-B/16 (2-class head)
+import numpy as np
+import jax.numpy as jnp
+import optax
+
+from vit_jax import models_vit
+from vit_jax import checkpoint as vit_checkpoint
+from vit_jax.configs import models as model_configs
+
+cfg = model_configs.get_b16_config()
+print("Model            :", cfg.model_name)
+print("Patch size       :", cfg.patches.size)
+print("Hidden size      :", cfg.hidden_size)
+print("MLP dimension    :", cfg.transformer.mlp_dim)
+print("Attention heads  :", cfg.transformer.num_heads)
+print("Transformer layers:", cfg.transformer.num_layers)
+
+# Only the classification output is adapted to 2 classes (fake / real)
+model = models_vit.VisionTransformer(
+    num_classes=2,
+    patches=cfg.patches,
+    transformer=cfg.transformer,
+    hidden_size=cfg.hidden_size,
+    classifier=cfg.classifier,
+    representation_size=cfg.representation_size,
+)
+
+dummy_images = jnp.zeros((1, 224, 224, 3), dtype=jnp.float32)   # NHWC
+variables = model.init(jax.random.PRNGKey(SEED), dummy_images, train=False)
+logits = model.apply(variables, dummy_images, train=False)
+print("Forward pass OK, output shape:", logits.shape)
+print("Parameter count:",
+      sum(x.size for x in jax.tree_util.tree_leaves(variables["params"])))
+
+
+# %% ------------------------- 1d. Load the official ImageNet-21k weights
+if not os.path.exists(VIT_CHECKPOINT):
+    sh(f"gsutil cp gs://vit_models/imagenet21k/ViT-B_16.npz {VIT_CHECKPOINT}")
+print("Checkpoint downloaded:", os.path.exists(VIT_CHECKPOINT))
+print("Checkpoint size (MB):", round(os.path.getsize(VIT_CHECKPOINT) / 1024 ** 2, 2))
+
+pretrained_params = vit_checkpoint.load_pretrained(
+    pretrained_path=VIT_CHECKPOINT,
+    init_params=variables["params"],     # keeps the fresh 2-class head
+    model_config=cfg,
+)
+variables = {**variables, "params": pretrained_params}
+
+assert variables["params"]["head"]["kernel"].shape == (768, 2)
+logits = model.apply(variables, dummy_images, train=False)
+print("Pretrained ViT-B/16 verification passed. Probabilities:",
+      jax.nn.softmax(logits, axis=-1))
+
+
+# %% -------------------------------------------- 2. DATA: load + split
+from collections import Counter
+from datasets import load_dataset
+
+dataset = load_dataset("prithivMLmods/OpenDeepfake-Preview")
+print(dataset)
+print("Features:", dataset["train"].features)
+print("Total images:", len(dataset["train"]))
+print("Label counts:", Counter(dataset["train"]["label"]))
+
+# Stratified 70 / 15 / 15 split, seed 42 (Hugging Face train_test_split)
+split_1 = dataset["train"].train_test_split(
+    test_size=0.30, seed=SEED, stratify_by_column="label")
+split_2 = split_1["test"].train_test_split(
+    test_size=0.50, seed=SEED, stratify_by_column="label")
+
+train_ds = split_1["train"]
+val_ds = split_2["train"]
+test_ds = split_2["test"]
+
+for name, ds in [("Train", train_ds), ("Validation", val_ds), ("Test", test_ds)]:
+    print(f"{name:10s}: {len(ds):6d} images  labels={Counter(ds['label'])}")
+
+assert len(train_ds) + len(val_ds) + len(test_ds) == len(dataset["train"])
+for ds in (train_ds, val_ds, test_ds):
+    assert set(ds["label"]) == {0, 1}
+print("Split verification passed. Labels:", dataset["train"].features["label"].names)
+
+
+# %% -------------------------------- 3. PREPROCESSING + BATCH GENERATOR
+from PIL import Image
+
+IMAGE_SIZE = 224
+
+
+def preprocess_image(image):
+    """RGB -> 224x224 (bicubic) -> scale to [-1, 1] (official Google ViT)."""
+    image = image.convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE),
+                                        Image.Resampling.BICUBIC)
+    image = np.asarray(image, dtype=np.float32)
+    return (image - 127.5) / 127.5
+
+
+def create_batches(ds, batch_size=2, shuffle=False):
+    indices = np.arange(len(ds))
+    if shuffle:
+        np.random.shuffle(indices)
+    for start in range(0, len(indices), batch_size):
+        batch_indices = indices[start:start + batch_size]
+        images, labels = [], []
+        for idx in batch_indices:
+            sample = ds[int(idx)]
+            images.append(preprocess_image(sample["image"]))
+            labels.append(sample["label"])
+        yield np.asarray(images, dtype=np.float32), np.asarray(labels, dtype=np.int32)
+
+
+sample_image = preprocess_image(train_ds[0]["image"])
+print("Processed shape:", sample_image.shape, "| range:",
+      sample_image.min(), sample_image.max())
+
+
+# %% ------------------------- 4. BASELINE: frozen ViT features + LogReg
+if RUN_BASELINE:
+    import time
+    import json
+    import joblib
+    from pathlib import Path
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                                 f1_score, roc_auc_score, classification_report,
+                                 confusion_matrix)
+
+    # --- feature extractor: ViT backbone without the classification head ----
+    # NOTE: this cell was missing from the latest notebook export (it exists in
+    # the earlier PROJECT.ipynb); it is required by the baseline.
+    feature_model = models_vit.VisionTransformer(
+        num_classes=0,                    # no classification head
+        patches=cfg.patches,
+        transformer=cfg.transformer,
+        hidden_size=cfg.hidden_size,
+        classifier=cfg.classifier,
+        representation_size=None,
+    )
+    feature_variables = {"params": {k: v for k, v in variables["params"].items()
+                                    if k != "head"}}
+
+    @jax.jit
+    def extract_features(images):
+        return feature_model.apply(feature_variables, images, train=False)
+
+    def extract_split_features(ds, split_name):
+        feats, labs = [], []
+        t0 = time.time()
+        for start in range(0, len(ds), FEATURE_BATCH_SIZE):
+            end = min(start + FEATURE_BATCH_SIZE, len(ds))
+            samples = [ds[i] for i in range(start, end)]
+            batch = np.stack([preprocess_image(s["image"]) for s in samples])
+            feats.append(np.asarray(extract_features(jnp.asarray(batch))))
+            labs.extend(s["label"] for s in samples)
+            if (start // FEATURE_BATCH_SIZE) % 100 == 0:
+                print(f"{split_name}: {end}/{len(ds)} images processed")
+        X = np.concatenate(feats).astype(np.float32)
+        y = np.asarray(labs, dtype=np.int32)
+        np.savez_compressed(f"{RESULTS_DIR}/{split_name}_features.npz",
+                            features=X, labels=y)
+        print(f"{split_name} done: {X.shape}, {(time.time() - t0) / 60:.2f} min")
+        return X, y
+
+    X_train, y_train = extract_split_features(train_ds, "train")
+    X_val, y_val = extract_split_features(val_ds, "validation")
+    X_test, y_test = extract_split_features(test_ds, "test")
+
+    # --- choose C on validation ROC-AUC only --------------------------------
+    best_C, best_val_auc = None, -1.0
+    for C in [0.01, 0.1, 1.0, 10.0]:
+        clf = LogisticRegression(C=C, max_iter=1000, class_weight="balanced",
+                                 random_state=SEED).fit(X_train, y_train)
+        auc_val = roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])
+        print(f"C={C}: validation ROC-AUC={auc_val:.4f}")
+        if auc_val > best_val_auc:
+            best_C, best_val_auc = C, auc_val
+    print("Selected C:", best_C, "| best validation ROC-AUC:", round(best_val_auc, 4))
+
+    # --- final baseline: refit on train + validation, evaluate on test ------
+    final_classifier = LogisticRegression(
+        C=best_C, max_iter=1000, class_weight="balanced", random_state=SEED
+    ).fit(np.concatenate([X_train, X_val]), np.concatenate([y_train, y_val]))
+
+    test_probs = final_classifier.predict_proba(X_test)[:, 1]
+    test_preds = final_classifier.predict(X_test)
+    print("Test accuracy :", round(accuracy_score(y_test, test_preds), 4))
+    print("Test precision:", round(precision_score(y_test, test_preds), 4))
+    print("Test recall   :", round(recall_score(y_test, test_preds), 4))
+    print("Test F1       :", round(f1_score(y_test, test_preds), 4))
+    print("Test ROC-AUC  :", round(roc_auc_score(y_test, test_probs), 4))
+    print(classification_report(y_test, test_preds, labels=[0, 1],
+                                target_names=["Fake", "Real"], zero_division=0))
+    print("Confusion matrix:\n", confusion_matrix(y_test, test_preds))
+
+    # --- optional: decision threshold tuned on validation (train-only fit) --
+    threshold_model = LogisticRegression(
+        C=best_C, max_iter=1000, class_weight="balanced", random_state=SEED
+    ).fit(X_train, y_train)
+    val_probs = threshold_model.predict_proba(X_val)[:, 1]
+    best_threshold, best_macro_f1 = 0.5, -1.0
+    for thr in np.arange(0.20, 0.81, 0.02):
+        score = f1_score(y_val, (val_probs >= thr).astype(int), average="macro")
+        if score > best_macro_f1:
+            best_threshold, best_macro_f1 = thr, score
+    print("Selected threshold:", round(best_threshold, 2),
+          "| validation macro-F1:", round(best_macro_f1, 4))
+    tp = threshold_model.predict_proba(X_test)[:, 1]
+    tpred = (tp >= best_threshold).astype(int)
+    print("Tuned-threshold test accuracy:", round(accuracy_score(y_test, tpred), 4),
+          "| ROC-AUC:", round(roc_auc_score(y_test, tp), 4))
+    print("Confusion matrix:\n", confusion_matrix(y_test, tpred))
+
+    # --- save baseline artifacts -------------------------------------------
+    joblib.dump(final_classifier, f"{RESULTS_DIR}/vit_frozen_logistic_baseline.joblib")
+    baseline_metrics = {
+        "model": "Google Research ViT-B/16 frozen features + Logistic Regression",
+        "dataset": "OpenDeepfake-Preview",
+        "training_images": len(train_ds),
+        "validation_images": len(val_ds),
+        "test_images": len(test_ds),
+        "best_C": float(best_C),
+        "accuracy": float(accuracy_score(y_test, test_preds)),
+        "precision_macro": float(precision_score(y_test, test_preds, average="macro")),
+        "recall_macro": float(recall_score(y_test, test_preds, average="macro")),
+        "f1_macro": float(f1_score(y_test, test_preds, average="macro")),
+        "roc_auc": float(roc_auc_score(y_test, test_probs)),
+    }
+    with open(f"{RESULTS_DIR}/baseline_metrics.json", "w") as f:
+        json.dump(baseline_metrics, f, indent=4)
+    print(json.dumps(baseline_metrics, indent=4))
+
+
+# %% --------------------------------- 5. FINE-TUNING (all parameters)
+import time
+import json
+from flax import serialization
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, confusion_matrix,
+                             classification_report)
+
+np.random.seed(SEED)
+
+optimizer = optax.adamw(learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+
+@jax.jit
+def train_step(params, opt_state, images, labels):
+    def loss_fn(current_params):
+        logits = model.apply({"params": current_params}, images, train=True)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+        accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
+        return loss, accuracy
+
+    (loss, accuracy), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    updates, new_opt_state = optimizer.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), new_opt_state, loss, accuracy
+
+
+@jax.jit
+def eval_step(params, images, labels):
+    logits = model.apply({"params": params}, images, train=False)
+    loss_sum = optax.softmax_cross_entropy_with_integer_labels(logits, labels).sum()
+    return loss_sum, jnp.sum(jnp.argmax(logits, axis=-1) == labels)
+
+
+def evaluate_model(params, ds, batch_size=EVAL_BATCH_SIZE):
+    """Return (mean loss, accuracy) of `params` on `ds`."""
+    total_loss, total_correct, total = 0.0, 0, 0
+    for images, labels in create_batches(ds, batch_size=batch_size):
+        loss_sum, correct = eval_step(params, jnp.asarray(images), jnp.asarray(labels))
+        total_loss += float(loss_sum)
+        total_correct += int(correct)
+        total += len(labels)
+    return total_loss / total, total_correct / total
+
+
+def get_preds(params, ds, batch_size=EVAL_BATCH_SIZE):
+    """Return (y_true, y_pred, y_score = P(real)) on `ds`."""
+    yt, yp, ys = [], [], []
+    for images, labels in create_batches(ds, batch_size=batch_size):
+        probs = jax.nn.softmax(
+            model.apply({"params": params}, jnp.asarray(images), train=False), axis=-1)
+        yt += labels.tolist()
+        yp += np.asarray(jnp.argmax(probs, axis=-1)).tolist()
+        ys += np.asarray(probs[:, 1]).tolist()
+    return np.array(yt), np.array(yp), np.array(ys)
+
+
+def run_epoch(epoch, params, opt_state):
+    t0 = time.time()
+    tot_loss = tot_correct = tot_n = 0.0
+    for images, labels in create_batches(train_ds, batch_size=FT_BATCH_SIZE, shuffle=True):
+        params, opt_state, loss, acc = train_step(
+            params, opt_state, jnp.asarray(images), jnp.asarray(labels))
+        n = len(labels)
+        tot_loss += float(loss) * n
+        tot_correct += float(acc) * n
+        tot_n += n
+    val_loss, val_acc = evaluate_model(params, val_ds)
+    stats = dict(train_loss=tot_loss / tot_n, train_accuracy=tot_correct / tot_n,
+                 val_loss=val_loss, val_accuracy=val_acc)
+    print(f"Epoch {epoch}: train loss {stats['train_loss']:.4f} "
+          f"acc {stats['train_accuracy']:.4f} | val loss {val_loss:.4f} "
+          f"acc {val_acc:.4f} | {(time.time() - t0) / 60:.1f} min")
+    return params, opt_state, stats
+
+
+history = {"train_loss": [], "train_accuracy": [], "val_loss": [], "val_accuracy": []}
+best_val_loss, best_epoch = float("inf"), 0
+ft_params = None
+
+if RUN_FINETUNE:
+    have_ckpt = os.path.exists(BEST_CKPT)
+    if have_ckpt and not FORCE_RETRAIN:
+        # Reproduce the reported results from the saved epoch-1 checkpoint
+        print("Loading saved checkpoint:", BEST_CKPT)
+        with open(BEST_CKPT, "rb") as f:
+            ft_params = serialization.from_bytes(variables["params"], f.read())
+        ft_params = jax.tree_util.tree_map(jnp.asarray, ft_params)
+        best_epoch = 1
+    else:
+        # Epoch 1, starting from the official pretrained weights
+        ft_params = variables["params"]
+        opt_state = optimizer.init(ft_params)
+        print("Fine-tuning parameters:",
+              sum(p.size for p in jax.tree_util.tree_leaves(ft_params)))
+        ft_params, opt_state, stats = run_epoch(1, ft_params, opt_state)
+        for k, v in stats.items():
+            history[k].append(v)
+        best_val_loss, best_epoch = stats["val_loss"], 1
+        with open(BEST_CKPT, "wb") as f:                 # best (= epoch 1) checkpoint
+            f.write(serialization.to_bytes(ft_params))
+        with open(f"{CHECKPOINT_DIR}/vit_epoch1.msgpack", "wb") as f:
+            f.write(serialization.to_bytes(ft_params))
+        print("Best checkpoint saved:", BEST_CKPT)
+
+    best_params = ft_params   # epoch-1 weights (selected by validation loss)
+
+    # ---- held-out TEST evaluation of the selected model (run once) --------
+    y_true, y_pred, y_scores = get_preds(best_params, test_ds)
+    print("TEST RESULTS (selected model)")
+    print("Accuracy :", accuracy_score(y_true, y_pred))
+    print("Precision:", precision_score(y_true, y_pred), "(positive class = real)")
+    print("Recall   :", recall_score(y_true, y_pred), "(positive class = real)")
+    print("F1       :", f1_score(y_true, y_pred))
+    print("ROC-AUC  :", roc_auc_score(y_true, y_scores))
+    print("Errors   :", int((y_true != y_pred).sum()))
+    print("Confusion matrix (rows = true fake/real):\n", confusion_matrix(y_true, y_pred))
+    print(classification_report(y_true, y_pred, target_names=["Fake", "Real"]))
+
+    np.savez(f"{RESULTS_DIR}/epoch1_predictions.npz",
+             y_true=y_true, y_pred=y_pred, y_scores=y_scores)
+    final_results = {
+        "model": "ViT-B/16 Fine-Tuned",
+        "dataset": "OpenDeepfake-Preview",
+        "epochs": 1,
+        "batch_size": FT_BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "test_accuracy": float(accuracy_score(y_true, y_pred)),
+        "test_precision": float(precision_score(y_true, y_pred)),
+        "test_recall": float(recall_score(y_true, y_pred)),
+        "test_f1": float(f1_score(y_true, y_pred)),
+        "test_roc_auc": float(roc_auc_score(y_true, y_scores)),
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+    }
+    with open(f"{RESULTS_DIR}/fine_tuned_vit_results.json", "w") as f:
+        json.dump(final_results, f, indent=4)
+
+
+# %% ---------------------------- 5b. Figures: confusion matrix + ROC
+if RUN_FINETUNE:
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import ConfusionMatrixDisplay, roc_curve, auc
+
+    ConfusionMatrixDisplay.from_predictions(
+        y_true, y_pred, display_labels=["Fake", "Real"], cmap="Blues")
+    plt.title("ViT-B/16 Fine-Tuned - Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(f"{RESULTS_DIR}/vit_confusion_matrix.png", dpi=300)
+    plt.show()
+
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    plt.figure(figsize=(7, 5))
+    plt.plot(fpr, tpr, label=f"ViT-B/16 (AUC = {auc(fpr, tpr):.4f})")
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve - Fine-Tuned ViT-B/16")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig(f"{RESULTS_DIR}/vit_roc_curve.png", dpi=300)
+    plt.show()
+
+
+# %% ------------------- 6. ABLATION: epochs 2-3 (analysis only, optional)
+# Continues from the epoch-1 weights with a RE-INITIALISED AdamW state, exactly
+# as in the reported ablation. The final model is still chosen by validation
+# loss; test numbers for epochs 2-3 are for analysis, not selection.
+if RUN_FINETUNE and RUN_ABLATION:
+    # Recorded epoch-1 statistics (used when epoch 1 was loaded from a checkpoint)
+    if not history["val_loss"]:
+        history = {"train_loss": [0.2178], "train_accuracy": [0.9269],
+                   "val_loss": [0.0555], "val_accuracy": [0.9800]}
+    best_val_loss, best_epoch = history["val_loss"][0], 1
+    best_params = ft_params
+    epoch_params = {1: ft_params}
+
+    opt_state = optimizer.init(ft_params)          # re-initialised optimiser state
+    cur_params = ft_params
+    np.random.seed(SEED)
+    for epoch in (2, 3):
+        cur_params, opt_state, stats = run_epoch(epoch, cur_params, opt_state)
+        for k, v in stats.items():
+            history[k].append(v)
+        epoch_params[epoch] = cur_params
+        with open(f"{CHECKPOINT_DIR}/vit_epoch{epoch}.msgpack", "wb") as f:
+            f.write(serialization.to_bytes(cur_params))
+        if stats["val_loss"] < best_val_loss:
+            best_val_loss, best_params, best_epoch = stats["val_loss"], cur_params, epoch
+    print("Best epoch by validation loss:", best_epoch)
+    with open(f"{RESULTS_DIR}/training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    ablation = {}
+    for name, ep in [("epoch1", 1), ("epoch2", 2), ("epoch3", 3)]:
+        yt, yp, ys = get_preds(epoch_params[ep], test_ds)
+        ablation[name] = {"acc": float((yt == yp).mean()),
+                          "auc": float(roc_auc_score(yt, ys)),
+                          "errors": int((yt != yp).sum())}
+        print(name, ablation[name])
+    with open(f"{RESULTS_DIR}/ablation_epochs.json", "w") as f:
+        json.dump(ablation, f, indent=2)
+
+    # learning curves
+    ep_axis = [1, 2, 3]
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    for key, label in [("train_loss", "Train"), ("val_loss", "Validation")]:
+        ax[0].plot(ep_axis, history[key], "o-", label=label)
+    for key, label in [("train_accuracy", "Train"), ("val_accuracy", "Validation")]:
+        ax[1].plot(ep_axis, history[key], "o-", label=label)
+    for a, ylabel in zip(ax, ["Loss", "Accuracy"]):
+        a.set_xlabel("Epoch"); a.set_ylabel(ylabel); a.set_xticks(ep_axis)
+        a.legend(); a.grid(alpha=.3)
+    plt.tight_layout()
+    plt.savefig(f"{RESULTS_DIR}/vit_learning_curves.png", dpi=300)
+    plt.show()
+
+
+# %% --------------- 7. DUPLICATE AUDIT on the EVALUATED train/val/test split
+# Exact-duplicate check by hashing decoded pixels (size + RGB bytes).
+# Uses its own variable names, so it never overwrites train_ds / test_ds.
+if RUN_DUPLICATE_AUDIT:
+    import hashlib
+    from collections import defaultdict
+
+    def image_hash(image):
+        image = image.convert("RGB")
+        return hashlib.sha256(str(image.size).encode() + image.tobytes()).hexdigest()
+
+    where = defaultdict(list)                       # hash -> [(split, index, label)]
+    for split_name, ds in [("train", train_ds), ("validation", val_ds), ("test", test_ds)]:
+        print("Hashing:", split_name)
+        for idx, sample in enumerate(ds):
+            where[image_hash(sample["image"])].append((split_name, idx, sample["label"]))
+
+    total = sum(len(v) for v in where.values())
+    cross = {h: loc for h, loc in where.items() if len({s for s, _, _ in loc}) > 1}
+    conflicting = [h for h, loc in where.items() if len({l for _, _, l in loc}) > 1]
+    test_in_train = {h for h, loc in cross.items()
+                     if any(s == "test" for s, _, _ in loc)
+                     and any(s == "train" for s, _, _ in loc)}
+    test_leaked_idx = sorted({i for h in test_in_train
+                              for s, i, _ in where[h] if s == "test"})
+
+    print("\nDUPLICATE AUDIT (evaluated split)")
+    print("Total images             :", total)
+    print("Unique pixel hashes      :", len(where))
+    print("Redundant exact copies   :", total - len(where))
+    print("Cross-split groups       :", len(cross))
+    print("Groups with label conflict:", len(conflicting))
+    print("Test images also in train:", len(test_leaked_idx))
+
+    # Accuracy with train-duplicated test images removed (if predictions exist)
+    if RUN_FINETUNE:
+        keep = np.ones(len(y_true), dtype=bool)
+        keep[test_leaked_idx] = False
+        print(f"Test accuracy, full test set      : {(y_true == y_pred).mean():.4f}  (n={len(y_true)})")
+        print(f"Test accuracy, leakage-free subset: "
+              f"{(y_true[keep] == y_pred[keep]).mean():.4f}  (n={int(keep.sum())})")
+        print(f"Test ROC-AUC, leakage-free subset : "
+              f"{roc_auc_score(y_true[keep], y_scores[keep]):.4f}")
+
+print("\nDone. Results are in:", RESULTS_DIR)
